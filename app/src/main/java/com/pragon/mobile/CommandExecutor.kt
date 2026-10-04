@@ -496,7 +496,8 @@ object CommandExecutor {
                 else Res(false, "Screenshots by voice need Android 9 or newer.", unsupported = true)
             "volume_up", "volume_down" -> {
                 val dir = if (name == "volume_up") AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER
-                repeat(count) { audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, dir, if (it == count - 1) AudioManager.FLAG_SHOW_UI else 0) }
+                val st = volStream(audio)
+                repeat(count) { audio.adjustStreamVolume(st, dir, if (it == count - 1) AudioManager.FLAG_SHOW_UI else 0) }
                 Res(true, "Volume ${if (name == "volume_up") "up" else "down"}" + (if (count > 1) " x$count" else "") + ".")
             }
             "mute" -> {
@@ -813,22 +814,45 @@ object CommandExecutor {
 
     private fun pct(level: Int, max: Int) = if (max <= 0) 0 else Math.round(100f * level / max)
 
+    /** Which stream "volume" means: the call stream during a call, otherwise media. */
+    private fun volStream(am: AudioManager): Int =
+        if (am.mode == AudioManager.MODE_IN_CALL || am.mode == AudioManager.MODE_IN_COMMUNICATION) AudioManager.STREAM_VOICE_CALL
+        else AudioManager.STREAM_MUSIC
+
     private fun volume(ctx: Context, v: String): Res {
         val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        val stream = if (am.mode == AudioManager.MODE_IN_CALL || am.mode == AudioManager.MODE_IN_COMMUNICATION) AudioManager.STREAM_VOICE_CALL else AudioManager.STREAM_MUSIC
+        val stream = volStream(am)
         val max = am.getStreamMaxVolume(stream)
-        val cur = am.getStreamVolume(stream)
         val a = adj(v)
-        val next = newLevel(a, cur, max, 10, if (a.kind == 'm') 1 else 0)
+        // A muted stream keeps reporting its old level, so "louder" used to compute from a wrong number and the phone stayed
+        // silent while Pragon said "Volume 70 percent". Treat a muted stream as level 0 and un-mute it first.
+        val muted = Build.VERSION.SDK_INT >= 23 && am.isStreamMute(stream)
+        val cur = if (muted) 0 else am.getStreamVolume(stream)
+        val next = newLevel(a, cur, max, 10, if (a.kind == 'm') Math.min(1, max) else 0)
         if (next == cur) {
             return Res(true, when {
+                muted -> "Volume is muted."
                 a.kind == '+' || a.kind == 'M' -> "Volume is already at maximum."
                 a.kind == '-' || a.kind == 'm' -> "Volume is already as low as it goes."
                 else -> "Volume is already ${pct(cur, max)} percent."
             }, label = "Volume")
         }
+        if (muted && Build.VERSION.SDK_INT >= 23) am.adjustStreamVolume(stream, AudioManager.ADJUST_UNMUTE, 0)
         am.setStreamVolume(stream, next, AudioManager.FLAG_SHOW_UI)
-        return Res(true, "Volume ${pct(next, max)} percent.", label = "Volume")
+        var now = am.getStreamVolume(stream)
+        if (now != next) {
+            // Some phones ignore setStreamVolume. Walk there with the same call the hardware volume keys use.
+            val dir = if (next > now) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER
+            var guard = 0
+            while (now != next && guard++ <= max) {
+                am.adjustStreamVolume(stream, dir, AudioManager.FLAG_SHOW_UI)
+                val after = am.getStreamVolume(stream)
+                if (after == now) break                                  // the phone won't move any further
+                now = after
+                if ((dir == AudioManager.ADJUST_RAISE && now >= next) || (dir == AudioManager.ADJUST_LOWER && now <= next)) break
+            }
+        }
+        return Res(true, "Volume ${pct(now, max)} percent.", label = "Volume")
     }
 
     private fun brightness(ctx: Context, v: String): Res {
